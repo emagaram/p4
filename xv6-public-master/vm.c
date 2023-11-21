@@ -6,6 +6,7 @@
 #include "mmu.h"
 #include "proc.h"
 #include "elf.h"
+#include "spinlock.h"
 
 extern char data[]; // defined by kernel.ld
 pde_t *kpgdir;      // for use in scheduler()
@@ -13,9 +14,13 @@ pde_t *kpgdir;      // for use in scheduler()
 // Set up CPU's kernel segment descriptors.
 // Run once on entry on each CPU.
 
-uchar refcounters[PHYSTOP / PGSIZE];
-struct spinlock refcounters_lock;
+struct {
+  uchar counters[PHYSTOP / PGSIZE];
+  struct spinlock lock;
+} refcounters;
+void pagefault(){
 
+}
 void seginit(void)
 {
   struct cpu *c;
@@ -195,9 +200,9 @@ void inituvm(pde_t *pgdir, char *init, uint sz)
   memset(mem, 0, PGSIZE);
   mappages(pgdir, 0, PGSIZE, V2P(mem), PTE_W | PTE_U);
   memmove(mem, init, sz);
-  acquire(&refcounters_lock);
-  refcounters[V2P(mem) >> PTXSHIFT]++;
-  release(&refcounters_lock);
+  // acquire(&refcounters_lock);
+  // refcounters[V2P(mem) >> PTXSHIFT]++;
+  // release(&refcounters_lock);
 }
 
 // Load a program segment into pgdir.  addr must be page-aligned
@@ -254,9 +259,9 @@ int allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       kfree(mem);
       return 0;
     }
-    acquire(&refcounters_lock);
-    refcounters[V2P(mem) >> PTXSHIFT]++;
-    release(&refcounters_lock);
+    acquire(&refcounters.lock);
+    refcounters.counters[V2P(mem) >> PTXSHIFT]++;
+    release(&refcounters.lock);
   }
   return newsz;
 }
@@ -284,18 +289,21 @@ int deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       pa = PTE_ADDR(*pte);
       if (pa == 0)
         panic("kfree");
-      acquire(&refcounters_lock);
-      if (refcounters[pa >> PTXSHIFT] == 0)
+      acquire(&refcounters.lock);
+      if (refcounters.counters[pa >> PTXSHIFT] == 0)
       {
         char *v = P2V(pa);
         kfree(v);
         *pte = 0;
       }
-      else if(--refcounters[pa >> PTXSHIFT] == 0)
+      else if (--refcounters.counters[pa >> PTXSHIFT] == 0)
       {
-        //Update shared and writable flag          
+        // Update shared and writable flag
+        *pte &= ~PTE_W;
+        *pte |= PTE_S;
       }
-      release(&refcounters_lock);
+
+      release(&refcounters.lock);
     }
   }
   return newsz;
@@ -366,7 +374,6 @@ bad:
   freevm(d);
   return 0;
 }
-
 
 // Given a parent process's page table, create a copy
 // of it for a child.
