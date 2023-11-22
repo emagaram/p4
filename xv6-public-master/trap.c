@@ -78,7 +78,7 @@ void trap(struct trapframe *tf)
     lapiceoi();
     break;
   case T_PGFLT:
-    pagefault();
+    // pagefault();
     break;
 
   // PAGEBREAK: 13

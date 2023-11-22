@@ -10,7 +10,7 @@
 
 extern char data[]; // defined by kernel.ld
 pde_t *kpgdir;      // for use in scheduler()
-struct proc *proc;
+struct proc *proc2;
 
 // Set up CPU's kernel segment descriptors.
 // Run once on entry on each CPU.
@@ -57,8 +57,7 @@ void seginit(void)
   c->gdt[SEG_UCODE] = SEG(STA_X | STA_R, 0, 0xffffffff, DPL_USER);
   c->gdt[SEG_UDATA] = SEG(STA_W, 0, 0xffffffff, DPL_USER);
   lgdt(c->gdt, sizeof(c->gdt));
-  proc = myproc();
-  memset(refcounters.counters, 0, PHYSTOP / PGSIZE);
+  proc2 = myproc();
 }
 
 // Return the address of the PTE in page table pgdir
@@ -88,10 +87,31 @@ walkpgdir(pde_t *pgdir, const void *va, int alloc)
   }
   return &pgtab[PTX(va)];
 }
+
+void updateParentSharedRead()
+{
+  cprintf("Updating Parent\n");
+  for (uint i = 0; i < proc2->sz; i += PGSIZE)
+  {
+    pde_t *pte;
+    if ((pte = walkpgdir(proc2->parent->pgdir, (void *)i, 0)) == 0)
+      panic("cow: pte should exist");
+    if (!(*pte & PTE_P))
+      panic("cow: page not present");
+
+    *pte &= ~PTE_W;
+    *pte |= PTE_S;
+  }
+}
+
 void updateParent(uint ppa, uint va)
 {
   cprintf("Searching for parent\n");
-  pde_t *parent_pte = walkpgdir(proc->parent->pgdir, (void *)va, 0);
+  if (proc2->parent == 0)
+  {
+    return;
+  }
+  pde_t *parent_pte = walkpgdir(proc2->parent->pgdir, (void *)va, 0);
   if ((*parent_pte >> PTXSHIFT) == ppa)
   {
     cprintf("Found parent!\n");
@@ -104,6 +124,7 @@ void updateParent(uint ppa, uint va)
 static int
 mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
 {
+  cprintf("In Mappages\n");
   char *a, *last;
   pte_t *pte;
 
@@ -121,6 +142,7 @@ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
     a += PGSIZE;
     pa += PGSIZE;
   }
+  cprintf("Mpdone\n");
   return 0;
 }
 
@@ -221,8 +243,6 @@ void switchuvm(struct proc *p)
   popcli();
 }
 
-// Load the initcode into address 0 of pgdir.
-// sz must be less than a page.
 void inituvm(pde_t *pgdir, char *init, uint sz)
 {
   char *mem;
@@ -231,11 +251,12 @@ void inituvm(pde_t *pgdir, char *init, uint sz)
     panic("inituvm: more than a page");
   mem = kalloc();
   memset(mem, 0, PGSIZE);
-  mappages(pgdir, 0, PGSIZE, V2P(mem), PTE_U);
+  mappages(pgdir, 0, PGSIZE, V2P(mem), PTE_W | PTE_U);
   memmove(mem, init, sz);
   incrementCounters(V2P(mem) >> PTXSHIFT);
 }
 
+//
 // Load a program segment into pgdir.  addr must be page-aligned
 // and the pages from addr to addr+sz must already be mapped.
 int loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz)
@@ -260,11 +281,8 @@ int loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz)
   return 0;
 }
 
-// Allocate page tables and physical memory to grow process from oldsz to
-// newsz, which need not be page aligned.  Returns new size or 0 on error.
 int allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 {
-  cprintf("alloc called\n");
   char *mem;
   uint a;
 
@@ -284,7 +302,7 @@ int allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       return 0;
     }
     memset(mem, 0, PGSIZE);
-    if (mappages(pgdir, (char *)a, PGSIZE, V2P(mem), PTE_U) < 0)
+    if (mappages(pgdir, (char *)a, PGSIZE, V2P(mem), PTE_W | PTE_U) < 0)
     {
       cprintf("allocuvm out of memory (2)\n");
       deallocuvm(pgdir, newsz, oldsz);
@@ -301,7 +319,7 @@ int allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 // process size.  Returns the new process size.
 int deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 {
-  cprintf("Dealc called\n");
+  // cprintf("Dealc called\n");
   pte_t *pte;
   uint a, pa;
 
@@ -319,6 +337,10 @@ int deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       pa = PTE_ADDR(*pte);
       if (pa == 0)
         panic("kfree");
+
+      char *v = P2V(pa);
+      kfree(v);
+      *pte = 0;
       if (getCounters(pa >> PTXSHIFT) == 1)
       {
         char *v = P2V(pa);
@@ -330,7 +352,7 @@ int deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       {
         *pte |= PTE_W;
         *pte &= ~PTE_S;
-        updateParent(*pte >> PTXSHIFT, a);
+        // updateParent(*pte >> PTXSHIFT, a);
       }
       decrementCounters(pa >> PTXSHIFT);
     }
@@ -373,6 +395,7 @@ void clearpteu(pde_t *pgdir, char *uva)
 pde_t *
 cow(pde_t *pgdir, uint sz)
 {
+  cprintf("Calling COW");
   pde_t *d;
   pte_t *pte;
   uint pa, i, flags;
@@ -380,21 +403,25 @@ cow(pde_t *pgdir, uint sz)
     return 0;
   for (i = 0; i < sz; i += PGSIZE)
   {
-
+    cprintf("In loop\n");
     if ((pte = walkpgdir(pgdir, (void *)i, 0)) == 0)
       panic("cow: pte should exist");
     if (!(*pte & PTE_P))
       panic("cow: page not present");
+    cprintf("Walked\n");
     *pte &= ~PTE_W;
     *pte |= PTE_S;
+    if (proc2->parent != 0 && proc2->parent->pgdir != 0)
+    {
+      updateParentSharedRead();
+    }
     pa = PTE_ADDR(*pte);
-
     flags = PTE_FLAGS(*pte);
-
     mappages(d, (void *)i, PGSIZE, pa, flags);
     incrementCounters(pa >> PTXSHIFT);
   }
   lcr3(V2P(pgdir)); // Flush TLB
+  cprintf("Finished COW");
   return d;
 }
 
@@ -479,11 +506,12 @@ void pagefault()
 {
   cprintf("Pagefault:\n");
   uint va = rcr2();
+  cprintf("CR2: %d", va);
   if (va == 0)
   {
     panic("RCR2 0!");
   }
-  pte_t *pte = walkpgdir(proc->pgdir, (void *)va, 0);
+  pte_t *pte = walkpgdir(proc2->pgdir, (void *)va, 0);
   if ((*pte & PTE_S) != PTE_S)
   {
     panic("PTE not shared!\n");
@@ -493,7 +521,6 @@ void pagefault()
     panic("PTE not present!\n");
   }
 
-  cprintf("Aquired\n");
   if (getCounters(*pte >> PTXSHIFT) <= 1)
   {
     cprintf("Not shared");
@@ -509,8 +536,8 @@ void pagefault()
       char *mem;
       if ((mem = kalloc()) == 0)
       {
-        cprintf("No memory proc killed: %s, %d\n", proc->name, proc->pid);
-        proc->killed = 1;
+        cprintf("No memory proc killed: %s, %d\n", proc2->name, proc2->pid);
+        proc2->killed = 1;
         return;
       }
       memmove(mem, (char *)P2V(PTE_ADDR(*pte)), PGSIZE);
@@ -519,11 +546,11 @@ void pagefault()
       *pte |= PTE_U;
       *pte |= PTE_P;
       *pte &= ~PTE_S;
-      updateParent(*pte >> 12, va);
+      // updateParent(*pte >> 12, va);
     }
     cprintf("Released\n");
-    lcr3(V2P(proc->pgdir));
   }
+  lcr3(V2P(proc2->pgdir));
 }
 
 // PAGEBREAK!
