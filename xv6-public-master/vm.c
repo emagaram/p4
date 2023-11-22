@@ -300,6 +300,8 @@ int deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       {
         *pte |= PTE_W;
         *pte &= ~PTE_S;
+        pte_t *parent_pte = walkpgdir(myproc()->parent->pgdir, (char *)a, 0);
+        *parent_pte &= ~PTE_S;
       }
       refcounters.counters[pa >> PTXSHIFT]--;
       release(&refcounters.lock);
@@ -450,7 +452,7 @@ int copyout(pde_t *pgdir, uint va, void *p, uint len)
 
 void pagefault()
 {
-  cprintf("Calling pagefault\n");
+  cprintf("Pagefault:\n");
   uint addr = rcr2();
   if (addr == 0)
   {
@@ -460,11 +462,11 @@ void pagefault()
   pte_t *pte = walkpgdir(proc->pgdir, (void *)addr, 0);
   if ((*pte & PTE_S) != PTE_S)
   {
-    panic("PTE not shared!");
+    panic("PTE not shared!\n");
   }
   if ((*pte & PTE_P) != PTE_P)
   {
-    panic("PTE not present!");
+    panic("PTE not present!\n");
   }
   uint pa = PTE_ADDR(*pte);
 
@@ -478,8 +480,13 @@ void pagefault()
   }
   else
   {
-    cprintf("Shared");
-    --refcounters.counters[pa >> PTXSHIFT];
+    cprintf("Shared\n");
+    if (--refcounters.counters[pa >> PTXSHIFT] == 1)
+    {
+      cprintf("Change parent flag\n");
+      pte_t *parent_pte = walkpgdir(proc->parent->pgdir, (void *)addr, 0);
+      *parent_pte &= ~PTE_S;
+    }
     char *mem;
     if ((mem = kalloc()) == 0)
     {
@@ -488,7 +495,11 @@ void pagefault()
       return;
     }
     memmove(mem, (char *)P2V(pa), PGSIZE);
-    *pte = (V2P(mem) | PTE_W | PTE_U | PTE_P) & ~PTE_S;
+    *pte |= V2P(mem);
+    *pte |= PTE_W;
+    *pte |= PTE_U;
+    *pte |= PTE_P;
+    *pte &= ~PTE_S;
   }
   release(&refcounters.lock);
   cprintf("Released\n");
