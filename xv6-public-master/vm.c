@@ -63,7 +63,17 @@ walkpgdir(pde_t *pgdir, const void *va, int alloc)
   }
   return &pgtab[PTX(va)];
 }
-
+void updateParent(uint ppa, uint va)
+{
+  cprintf("Searching for parent\n");
+  struct proc *proc = myproc();
+  pde_t *parent_pte = walkpgdir(proc->parent->pgdir, (void *)va, 0);
+  if ((*parent_pte >> PTXSHIFT) == ppa)
+  {
+    cprintf("Found parent!\n");
+    *parent_pte &= ~PTE_S;
+  }
+}
 // Create PTEs for virtual addresses starting at va that refer to
 // physical addresses starting at pa. va and size might not
 // be page-aligned.
@@ -300,8 +310,7 @@ int deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       {
         *pte |= PTE_W;
         *pte &= ~PTE_S;
-        pte_t *parent_pte = walkpgdir(myproc()->parent->pgdir, (char *)a, 0);
-        *parent_pte &= ~PTE_S;
+        updateParent(*pte >> PTXSHIFT, a);
       }
       refcounters.counters[pa >> PTXSHIFT]--;
       release(&refcounters.lock);
@@ -359,7 +368,6 @@ cow(pde_t *pgdir, uint sz)
       panic("cow: page not present");
     *pte &= ~PTE_W;
     *pte |= PTE_S;
-
     pa = PTE_ADDR(*pte);
 
     flags = PTE_FLAGS(*pte);
@@ -453,13 +461,13 @@ int copyout(pde_t *pgdir, uint va, void *p, uint len)
 void pagefault()
 {
   cprintf("Pagefault:\n");
-  uint addr = rcr2();
-  if (addr == 0)
+  uint va = rcr2();
+  if (va == 0)
   {
     panic("RCR2 0!");
   }
   struct proc *proc = myproc();
-  pte_t *pte = walkpgdir(proc->pgdir, (void *)addr, 0);
+  pte_t *pte = walkpgdir(proc->pgdir, (void *)va, 0);
   if ((*pte & PTE_S) != PTE_S)
   {
     panic("PTE not shared!\n");
@@ -468,11 +476,10 @@ void pagefault()
   {
     panic("PTE not present!\n");
   }
-  uint pa = PTE_ADDR(*pte);
 
   acquire(&refcounters.lock);
   cprintf("Aquired\n");
-  if (refcounters.counters[pa >> PTXSHIFT] <= 1)
+  if (refcounters.counters[*pte >> PTXSHIFT] <= 1)
   {
     cprintf("Not shared");
     *pte &= ~PTE_S;
@@ -481,30 +488,29 @@ void pagefault()
   else
   {
     cprintf("Shared\n");
-    if (--refcounters.counters[pa >> PTXSHIFT] == 1)
+    if (--refcounters.counters[*pte >> PTXSHIFT] == 1)
     {
-      cprintf("Change parent flag\n");
-      pte_t *parent_pte = walkpgdir(proc->parent->pgdir, (void *)addr, 0);
-      *parent_pte &= ~PTE_S;
+      char *mem;
+      if ((mem = kalloc()) == 0)
+      {
+        cprintf("No memory proc killed: %s, %d\n", proc->name, proc->pid);
+        proc->killed = 1;
+        return;
+      }
+      memmove(mem, (char *)P2V(PTE_ADDR(*pte)), PGSIZE);
+      *pte |= V2P(mem);
+      *pte |= PTE_W;
+      *pte |= PTE_U;
+      *pte |= PTE_P;
+      *pte &= ~PTE_S;
+      updateParent(*pte >> 12, va);
     }
-    char *mem;
-    if ((mem = kalloc()) == 0)
-    {
-      cprintf("No memory proc killed: %s, %d\n", proc->name, proc->pid);
-      proc->killed = 1;
-      return;
-    }
-    memmove(mem, (char *)P2V(pa), PGSIZE);
-    *pte |= V2P(mem);
-    *pte |= PTE_W;
-    *pte |= PTE_U;
-    *pte |= PTE_P;
-    *pte &= ~PTE_S;
+    release(&refcounters.lock);
+    cprintf("Released\n");
+    lcr3(V2P(proc->pgdir));
   }
-  release(&refcounters.lock);
-  cprintf("Released\n");
-  lcr3(V2P(proc->pgdir));
 }
+
 // PAGEBREAK!
 //  Blank page.
 // PAGEBREAK!
