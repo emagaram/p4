@@ -10,6 +10,7 @@
 
 extern char data[]; // defined by kernel.ld
 pde_t *kpgdir;      // for use in scheduler()
+struct proc *proc;
 
 // Set up CPU's kernel segment descriptors.
 // Run once on entry on each CPU.
@@ -19,6 +20,28 @@ struct
   uchar counters[PHYSTOP / PGSIZE];
   struct spinlock lock;
 } refcounters;
+
+void incrementCounters(uint index)
+{
+  acquire(&refcounters.lock);
+  cprintf("incrementing at %d\n", index);
+  refcounters.counters[index]++;
+  release(&refcounters.lock);
+}
+void decrementCounters(uint index)
+{
+  acquire(&refcounters.lock);
+  cprintf("decrementing at %d\n", index);
+  refcounters.counters[index]++;
+  release(&refcounters.lock);
+}
+uint getCounters(uint index)
+{
+  acquire(&refcounters.lock);
+  uint val = refcounters.counters[index];
+  release(&refcounters.lock);
+  return val;
+}
 
 void seginit(void)
 {
@@ -34,6 +57,8 @@ void seginit(void)
   c->gdt[SEG_UCODE] = SEG(STA_X | STA_R, 0, 0xffffffff, DPL_USER);
   c->gdt[SEG_UDATA] = SEG(STA_W, 0, 0xffffffff, DPL_USER);
   lgdt(c->gdt, sizeof(c->gdt));
+  proc = myproc();
+  memset(refcounters.counters, 0, PHYSTOP / PGSIZE);
 }
 
 // Return the address of the PTE in page table pgdir
@@ -66,7 +91,6 @@ walkpgdir(pde_t *pgdir, const void *va, int alloc)
 void updateParent(uint ppa, uint va)
 {
   cprintf("Searching for parent\n");
-  struct proc *proc = myproc();
   pde_t *parent_pte = walkpgdir(proc->parent->pgdir, (void *)va, 0);
   if ((*parent_pte >> PTXSHIFT) == ppa)
   {
@@ -207,11 +231,9 @@ void inituvm(pde_t *pgdir, char *init, uint sz)
     panic("inituvm: more than a page");
   mem = kalloc();
   memset(mem, 0, PGSIZE);
-  mappages(pgdir, 0, PGSIZE, V2P(mem), PTE_W | PTE_U);
+  mappages(pgdir, 0, PGSIZE, V2P(mem), PTE_U);
   memmove(mem, init, sz);
-  acquire(&refcounters.lock);
-  refcounters.counters[V2P(mem) >> PTXSHIFT]++;
-  release(&refcounters.lock);
+  incrementCounters(V2P(mem) >> PTXSHIFT);
 }
 
 // Load a program segment into pgdir.  addr must be page-aligned
@@ -242,6 +264,7 @@ int loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz)
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 int allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 {
+  cprintf("alloc called\n");
   char *mem;
   uint a;
 
@@ -261,16 +284,13 @@ int allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       return 0;
     }
     memset(mem, 0, PGSIZE);
-    if (mappages(pgdir, (char *)a, PGSIZE, V2P(mem), PTE_W | PTE_U) < 0)
+    if (mappages(pgdir, (char *)a, PGSIZE, V2P(mem), PTE_U) < 0)
     {
       cprintf("allocuvm out of memory (2)\n");
       deallocuvm(pgdir, newsz, oldsz);
       kfree(mem);
       return 0;
     }
-    acquire(&refcounters.lock);
-    refcounters.counters[V2P(mem) >> PTXSHIFT]++;
-    release(&refcounters.lock);
   }
   return newsz;
 }
@@ -281,6 +301,7 @@ int allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 // process size.  Returns the new process size.
 int deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
 {
+  cprintf("Dealc called\n");
   pte_t *pte;
   uint a, pa;
 
@@ -298,22 +319,20 @@ int deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       pa = PTE_ADDR(*pte);
       if (pa == 0)
         panic("kfree");
-      acquire(&refcounters.lock);
-      if (refcounters.counters[pa >> PTXSHIFT] == 1)
+      if (getCounters(pa >> PTXSHIFT) == 1)
       {
         char *v = P2V(pa);
         kfree(v);
         *pte = 0;
       }
 
-      else if (refcounters.counters[pa >> PTXSHIFT] - 1 == 1)
+      else if (getCounters(pa >> PTXSHIFT) - 1 == 1)
       {
         *pte |= PTE_W;
         *pte &= ~PTE_S;
         updateParent(*pte >> PTXSHIFT, a);
       }
-      refcounters.counters[pa >> PTXSHIFT]--;
-      release(&refcounters.lock);
+      decrementCounters(pa >> PTXSHIFT);
     }
   }
   return newsz;
@@ -373,9 +392,7 @@ cow(pde_t *pgdir, uint sz)
     flags = PTE_FLAGS(*pte);
 
     mappages(d, (void *)i, PGSIZE, pa, flags);
-    acquire(&refcounters.lock);
-    refcounters.counters[pa >> PTXSHIFT]++;
-    release(&refcounters.lock);
+    incrementCounters(pa >> PTXSHIFT);
   }
   lcr3(V2P(pgdir)); // Flush TLB
   return d;
@@ -466,7 +483,6 @@ void pagefault()
   {
     panic("RCR2 0!");
   }
-  struct proc *proc = myproc();
   pte_t *pte = walkpgdir(proc->pgdir, (void *)va, 0);
   if ((*pte & PTE_S) != PTE_S)
   {
@@ -477,9 +493,8 @@ void pagefault()
     panic("PTE not present!\n");
   }
 
-  acquire(&refcounters.lock);
   cprintf("Aquired\n");
-  if (refcounters.counters[*pte >> PTXSHIFT] <= 1)
+  if (getCounters(*pte >> PTXSHIFT) <= 1)
   {
     cprintf("Not shared");
     *pte &= ~PTE_S;
@@ -488,7 +503,8 @@ void pagefault()
   else
   {
     cprintf("Shared\n");
-    if (--refcounters.counters[*pte >> PTXSHIFT] == 1)
+    decrementCounters(*pte >> PTXSHIFT);
+    if (getCounters(*pte >> PTXSHIFT) == 1)
     {
       char *mem;
       if ((mem = kalloc()) == 0)
@@ -505,7 +521,6 @@ void pagefault()
       *pte &= ~PTE_S;
       updateParent(*pte >> 12, va);
     }
-    release(&refcounters.lock);
     cprintf("Released\n");
     lcr3(V2P(proc->pgdir));
   }
