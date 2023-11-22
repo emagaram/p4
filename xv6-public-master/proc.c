@@ -194,7 +194,7 @@ int fork(void)
   }
 
   // Copy process state from proc.
-  if ((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0)
+  if ((np->pgdir = cow(curproc->pgdir, curproc->sz)) == 0)
   {
     kfree(np->kstack);
     np->kstack = 0;
@@ -539,7 +539,7 @@ void procdump(void)
       for (i = 0; i < 10 && pc[i] != 0; i++)
         cprintf(" %p", pc[i]);
     }
-    cprintf("\n");
+    cprintf("\nPage mappings:\n");
 
     pte_t *pgtab;
     pde_t pde = p->pgdir[0]; // Access the first entry in the page directory

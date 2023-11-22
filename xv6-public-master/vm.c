@@ -14,13 +14,12 @@ pde_t *kpgdir;      // for use in scheduler()
 // Set up CPU's kernel segment descriptors.
 // Run once on entry on each CPU.
 
-struct {
+struct
+{
   uchar counters[PHYSTOP / PGSIZE];
   struct spinlock lock;
 } refcounters;
-void pagefault(){
 
-}
 void seginit(void)
 {
   struct cpu *c;
@@ -200,9 +199,9 @@ void inituvm(pde_t *pgdir, char *init, uint sz)
   memset(mem, 0, PGSIZE);
   mappages(pgdir, 0, PGSIZE, V2P(mem), PTE_W | PTE_U);
   memmove(mem, init, sz);
-  // acquire(&refcounters_lock);
-  // refcounters[V2P(mem) >> PTXSHIFT]++;
-  // release(&refcounters_lock);
+  acquire(&refcounters.lock);
+  refcounters.counters[V2P(mem) >> PTXSHIFT]++;
+  release(&refcounters.lock);
 }
 
 // Load a program segment into pgdir.  addr must be page-aligned
@@ -290,19 +289,18 @@ int deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
       if (pa == 0)
         panic("kfree");
       acquire(&refcounters.lock);
-      if (refcounters.counters[pa >> PTXSHIFT] == 0)
+      if (refcounters.counters[pa >> PTXSHIFT] == 1)
       {
         char *v = P2V(pa);
         kfree(v);
         *pte = 0;
       }
-      else if (--refcounters.counters[pa >> PTXSHIFT] == 0)
-      {
-        // Update shared and writable flag
-        *pte &= ~PTE_W;
-        *pte |= PTE_S;
-      }
 
+      else if (--refcounters.counters[pa >> PTXSHIFT] <= 1)
+      {
+        *pte |= PTE_W;
+        *pte &= ~PTE_S;
+      }
       release(&refcounters.lock);
     }
   }
@@ -347,32 +345,29 @@ cow(pde_t *pgdir, uint sz)
   pde_t *d;
   pte_t *pte;
   uint pa, i, flags;
-  char *mem;
-
   if ((d = setupkvm()) == 0)
     return 0;
   for (i = 0; i < sz; i += PGSIZE)
   {
-    if ((pte = walkpgdir(pgdir, (void *)i, 0)) == 0)
-      panic("copyuvm: pte should exist");
-    if (!(*pte & PTE_P))
-      panic("copyuvm: page not present");
-    pa = PTE_ADDR(*pte);
-    flags = PTE_FLAGS(*pte);
-    if ((mem = kalloc()) == 0)
-      goto bad;
-    memmove(mem, (char *)P2V(pa), PGSIZE);
-    if (mappages(d, (void *)i, PGSIZE, V2P(mem), flags) < 0)
-    {
-      kfree(mem);
-      goto bad;
-    }
-  }
-  return d;
 
-bad:
-  freevm(d);
-  return 0;
+    if ((pte = walkpgdir(pgdir, (void *)i, 0)) == 0)
+      panic("cow: pte should exist");
+    if (!(*pte & PTE_P))
+      panic("cow: page not present");
+    *pte &= ~PTE_W;
+    *pte |= PTE_S;
+
+    pa = PTE_ADDR(*pte);
+
+    flags = PTE_FLAGS(*pte);
+
+    mappages(d, (void *)i, PGSIZE, pa, flags);
+    acquire(&refcounters.lock);
+    refcounters.counters[pa >> PTXSHIFT]++;
+    release(&refcounters.lock);
+  }
+  lcr3(V2P(pgdir)); // Flush TLB
+  return d;
 }
 
 // Given a parent process's page table, create a copy
@@ -452,6 +447,52 @@ int copyout(pde_t *pgdir, uint va, void *p, uint len)
   return 0;
 }
 
+void pagefault()
+{
+  cprintf("Calling pagefault\n");
+  uint addr = rcr2();
+  if (addr == 0)
+  {
+    panic("RCR2 0!");
+  }
+  struct proc *proc = myproc();
+  pte_t *pte = walkpgdir(proc->pgdir, (void*) addr, 0);
+  if (!(*pte & PTE_S))
+  {
+    panic("PTE not shared!");
+  }
+  if (!(*pte & PTE_P))
+  {
+    panic("PTE not present!");
+  }
+  uint pa = PTE_ADDR(*pte);
+  // uint ppn = pa >> PTXSHIFT;
+
+  char *mem;
+  acquire(&refcounters.lock);
+  cprintf("Aquired\n");
+  if (refcounters.counters[pa] == 0)
+  {
+    *pte &= ~PTE_S;
+    *pte |= PTE_W;
+  }
+  else
+  {
+    --refcounters.counters[pa];
+    if ((mem = kalloc()) == 0)
+    {
+      cprintf("No memory proc killed: %s, %d\n", proc->name, proc->pid);
+      proc->killed = 1;
+      return;
+    }
+    memmove(mem, (char *)P2V(pa), PGSIZE);
+    *pte = (V2P(mem) | PTE_FLAGS(*pte) | PTE_W | PTE_U | PTE_P) & ~PTE_S;
+    mappages(proc->pgdir, (void *)pa, PGSIZE, V2P(mem), PTE_FLAGS(*pte));
+  }
+  release(&refcounters.lock);
+  cprintf("Released\n");
+  lcr3(V2P(proc->pgdir));
+}
 // PAGEBREAK!
 //  Blank page.
 // PAGEBREAK!
