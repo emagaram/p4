@@ -296,11 +296,12 @@ int deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
         *pte = 0;
       }
 
-      else if (--refcounters.counters[pa >> PTXSHIFT] <= 1)
+      else if (refcounters.counters[pa >> PTXSHIFT] - 1 == 1)
       {
         *pte |= PTE_W;
         *pte &= ~PTE_S;
       }
+      refcounters.counters[pa >> PTXSHIFT]--;
       release(&refcounters.lock);
     }
   }
@@ -456,29 +457,30 @@ void pagefault()
     panic("RCR2 0!");
   }
   struct proc *proc = myproc();
-  pte_t *pte = walkpgdir(proc->pgdir, (void*) addr, 0);
-  if (!(*pte & PTE_S))
+  pte_t *pte = walkpgdir(proc->pgdir, (void *)addr, 0);
+  if ((*pte & PTE_S) != PTE_S)
   {
     panic("PTE not shared!");
   }
-  if (!(*pte & PTE_P))
+  if ((*pte & PTE_P) != PTE_P)
   {
     panic("PTE not present!");
   }
   uint pa = PTE_ADDR(*pte);
-  // uint ppn = pa >> PTXSHIFT;
 
-  char *mem;
   acquire(&refcounters.lock);
   cprintf("Aquired\n");
-  if (refcounters.counters[pa] == 0)
+  if (refcounters.counters[pa >> PTXSHIFT] <= 1)
   {
+    cprintf("Not shared");
     *pte &= ~PTE_S;
     *pte |= PTE_W;
   }
   else
   {
-    --refcounters.counters[pa];
+    cprintf("Shared");
+    --refcounters.counters[pa >> PTXSHIFT];
+    char *mem;
     if ((mem = kalloc()) == 0)
     {
       cprintf("No memory proc killed: %s, %d\n", proc->name, proc->pid);
@@ -486,8 +488,7 @@ void pagefault()
       return;
     }
     memmove(mem, (char *)P2V(pa), PGSIZE);
-    *pte = (V2P(mem) | PTE_FLAGS(*pte) | PTE_W | PTE_U | PTE_P) & ~PTE_S;
-    mappages(proc->pgdir, (void *)pa, PGSIZE, V2P(mem), PTE_FLAGS(*pte));
+    *pte = (V2P(mem) | PTE_W | PTE_U | PTE_P) & ~PTE_S;
   }
   release(&refcounters.lock);
   cprintf("Released\n");
